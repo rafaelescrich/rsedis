@@ -12,6 +12,7 @@ use dbutil::normalize_position;
 use error::OperationError;
 use rdbutil::constants::*;
 use rdbutil::{encode_len, encode_slice_u8};
+use util::glob_match;
 
 pub enum Aggregate {
     Sum,
@@ -182,6 +183,43 @@ impl ValueSortedSet {
         match *self {
             ValueSortedSet::Data(_, ref hmap) => hmap.len(),
         }
+    }
+
+    /// Scan sorted set members with scores using cursor-based iteration.
+    /// Returns (next_cursor, members_with_scores) where next_cursor is 0 when done.
+    /// The result alternates between member and score.
+    pub fn zscan(&self, cursor: usize, pattern: Option<&[u8]>, count: usize) -> (usize, Vec<Vec<u8>>) {
+        use util::glob_match;
+        let skiplist = match *self {
+            ValueSortedSet::Data(ref skiplist, _) => skiplist,
+        };
+        
+        let all_members: Vec<_> = skiplist.iter().collect();
+        let total = all_members.len();
+        
+        if cursor >= total {
+            return (0, Vec::new());
+        }
+        
+        let end = std::cmp::min(cursor + count, total);
+        let mut result = Vec::new();
+        
+        for i in cursor..end {
+            let member = all_members[i];
+            let member_vec = member.get_vec();
+            if let Some(pat) = pattern {
+                if glob_match(pat, member_vec, false) {
+                    result.push(member_vec.clone());
+                    result.push(format!("{}", member.get_f64()).into_bytes());
+                }
+            } else {
+                result.push(member_vec.clone());
+                result.push(format!("{}", member.get_f64()).into_bytes());
+            }
+        }
+        
+        let next_cursor = if end >= total { 0 } else { end };
+        (next_cursor, result)
     }
 
     pub fn zscore(&self, element: &[u8]) -> Option<f64> {

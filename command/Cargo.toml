@@ -11,5 +11,6 @@ config = { path = "../config" }
 database = { path = "../database" }
 logger = { path = "../logger" }
 parser = { path = "../parser" }
+rand = "0.3"
 response = { path = "../response" }
 util = { path = "../util" }

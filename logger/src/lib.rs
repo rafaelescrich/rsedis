@@ -228,15 +228,13 @@ impl Logger {
                                     }
                                 };
                                 if let Some(ref mut w) = syslog_writer {
-                                    match w.send_3164(
-                                        match lvl {
-                                            Level::Debug => syslog::Severity::LOG_DEBUG,
-                                            Level::Verbose => syslog::Severity::LOG_INFO,
-                                            Level::Notice => syslog::Severity::LOG_NOTICE,
-                                            Level::Warning => syslog::Severity::LOG_WARNING,
-                                        },
-                                        msg.clone(),
-                                    ) {
+                                    let severity = match lvl {
+                                        Level::Debug => syslog::Severity::LOG_DEBUG,
+                                        Level::Verbose => syslog::Severity::LOG_INFO,
+                                        Level::Notice => syslog::Severity::LOG_NOTICE,
+                                        Level::Warning => syslog::Severity::LOG_WARNING,
+                                    };
+                                    match w.send_3164(severity, msg.clone()) {
                                         Ok(_) => (),
                                         Err(e) => {
                                             // failing to log a message... will write straight to stderr

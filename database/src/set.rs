@@ -7,6 +7,7 @@ use dbutil::vec_to_usize;
 use rdbutil::constants::*;
 use rdbutil::{encode_len, encode_slice_u8, EncodeError};
 use rdbutil::{encode_u16_to_slice_u8, encode_u32_to_slice_u8, encode_u64_to_slice_u8};
+use util::glob_match;
 
 use rand::distributions::{IndependentSample, Range, Sample};
 use rand::thread_rng;
@@ -118,6 +119,34 @@ impl ValueSet {
             ValueSet::Data(set) => set.iter().cloned().collect::<Vec<_>>(),
             ValueSet::Integer(set) => set.iter().copied().map(usize_to_vec).collect::<Vec<_>>(),
         }
+    }
+
+    /// Scan set members with cursor-based iteration.
+    /// Returns (next_cursor, members) where next_cursor is 0 when done.
+    pub fn sscan(&self, cursor: usize, pattern: Option<&[u8]>, count: usize) -> (usize, Vec<Vec<u8>>) {
+        let all_members = self.smembers();
+        let total = all_members.len();
+        
+        if cursor >= total {
+            return (0, Vec::new());
+        }
+        
+        let end = std::cmp::min(cursor + count, total);
+        let mut result = Vec::new();
+        
+        for i in cursor..end {
+            let member = &all_members[i];
+            if let Some(pat) = pattern {
+                if glob_match(pat, member, false) {
+                    result.push(member.clone());
+                }
+            } else {
+                result.push(member.clone());
+            }
+        }
+        
+        let next_cursor = if end >= total { 0 } else { end };
+        (next_cursor, result)
     }
 
     fn get_random_positions(&self, len: usize, count: usize, allow_duplicates: bool) -> Vec<usize> {

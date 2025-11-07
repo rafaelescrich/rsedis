@@ -1,0 +1,19 @@
+# .dockerignore - Exclude unnecessary files from Docker build context
+target/
+.git/
+.gitignore
+*.md
+*.log
+test_client
+test_client.rs
+run_tests.sh
+tests/
+*.conf
+!rsedis.conf
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+

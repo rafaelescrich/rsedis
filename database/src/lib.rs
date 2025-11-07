@@ -14,6 +14,7 @@ extern crate util;
 
 pub mod dbutil;
 pub mod error;
+pub mod hash;
 pub mod list;
 pub mod set;
 pub mod string;
@@ -39,6 +40,7 @@ use response::Response;
 use util::{get_random_hex_chars, glob_match, mstime};
 
 use error::OperationError;
+use hash::ValueHash;
 use list::ValueList;
 use rdbutil::encode_u64_to_slice_u8;
 use set::ValueSet;
@@ -46,6 +48,23 @@ use string::ValueString;
 use zset::ValueSortedSet;
 
 const ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP: usize = 20;
+
+/// Represents a single slow log entry
+#[derive(Clone, Debug)]
+pub struct SlowLogEntry {
+    /// Unique ID for this slow log entry
+    pub id: u64,
+    /// Unix timestamp in seconds when the command was executed
+    pub timestamp: i64,
+    /// Execution time in microseconds
+    pub duration: u64,
+    /// Command name and arguments
+    pub command: Vec<Vec<u8>>,
+    /// Client IP address (simplified - just placeholder for now)
+    pub client_addr: String,
+    /// Client name (if set)
+    pub client_name: String,
+}
 
 /// Any value storable in the database
 #[derive(PartialEq, Debug)]
@@ -56,6 +75,7 @@ pub enum Value {
     List(ValueList),
     Set(ValueSet),
     SortedSet(ValueSortedSet),
+    Hash(ValueHash),
 }
 
 /// Events relevant for clients in pubsub mode
@@ -215,6 +235,23 @@ impl Value {
     pub fn is_set(&self) -> bool {
         match self {
             Value::Set(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Returns true if the value is a hash.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    /// use database::hash::ValueHash;
+    ///
+    /// assert!(!Value::Nil.is_hash());
+    /// assert!(Value::Hash(ValueHash::new()).is_hash());
+    /// ```
+    pub fn is_hash(&self) -> bool {
+        match self {
+            Value::Hash(_) => true,
             _ => false,
         }
     }
@@ -1051,6 +1088,260 @@ impl Value {
         *self = Value::Set(ValueSet::create_with_hashset(set));
     }
 
+    /// Sets a field in a hash. Returns true if the field was created, false if it was updated.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// assert_eq!(val.hset(b"field1".to_vec(), b"value1".to_vec()).unwrap(), true);
+    /// assert_eq!(val.hset(b"field1".to_vec(), b"value2".to_vec()).unwrap(), false);
+    /// ```
+    pub fn hset(&mut self, field: Vec<u8>, value: Vec<u8>) -> Result<bool, OperationError> {
+        match self {
+            Value::Nil => {
+                let mut hash = ValueHash::new();
+                let result = hash.hset(field, value);
+                *self = Value::Hash(hash);
+                Ok(result)
+            }
+            Value::Hash(hash) => Ok(hash.hset(field, value)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Gets a field from a hash.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// val.hset(b"field1".to_vec(), b"value1".to_vec()).unwrap();
+    /// assert_eq!(val.hget(b"field1").unwrap(), Some(&b"value1".to_vec()));
+    /// assert_eq!(val.hget(b"field2").unwrap(), None);
+    /// ```
+    pub fn hget(&self, field: &[u8]) -> Result<Option<&Vec<u8>>, OperationError> {
+        match self {
+            Value::Nil => Ok(None),
+            Value::Hash(hash) => Ok(hash.hget(field)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Deletes fields from a hash. Returns the number of fields removed.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// val.hset(b"field1".to_vec(), b"value1".to_vec()).unwrap();
+    /// val.hset(b"field2".to_vec(), b"value2".to_vec()).unwrap();
+    /// assert_eq!(val.hdel(&[b"field1", b"field3"]).unwrap(), 1);
+    /// ```
+    pub fn hdel(&mut self, fields: &[&[u8]]) -> Result<usize, OperationError> {
+        match self {
+            Value::Nil => Ok(0),
+            Value::Hash(hash) => Ok(hash.hdel(fields)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Checks if a field exists in a hash.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// assert_eq!(val.hexists(b"field1").unwrap(), false);
+    /// val.hset(b"field1".to_vec(), b"value1".to_vec()).unwrap();
+    /// assert_eq!(val.hexists(b"field1").unwrap(), true);
+    /// ```
+    pub fn hexists(&self, field: &[u8]) -> Result<bool, OperationError> {
+        match self {
+            Value::Nil => Ok(false),
+            Value::Hash(hash) => Ok(hash.hexists(field)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Returns the number of fields in a hash.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// assert_eq!(val.hlen().unwrap(), 0);
+    /// val.hset(b"field1".to_vec(), b"value1".to_vec()).unwrap();
+    /// assert_eq!(val.hlen().unwrap(), 1);
+    /// ```
+    pub fn hlen(&self) -> Result<usize, OperationError> {
+        match self {
+            Value::Nil => Ok(0),
+            Value::Hash(hash) => Ok(hash.hlen()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Returns all field names in a hash.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// val.hset(b"field1".to_vec(), b"value1".to_vec()).unwrap();
+    /// val.hset(b"field2".to_vec(), b"value2".to_vec()).unwrap();
+    /// let keys = val.hkeys().unwrap();
+    /// assert_eq!(keys.len(), 2);
+    /// ```
+    pub fn hkeys(&self) -> Result<Vec<Vec<u8>>, OperationError> {
+        match self {
+            Value::Nil => Ok(Vec::new()),
+            Value::Hash(hash) => Ok(hash.hkeys()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Returns all values in a hash.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// val.hset(b"field1".to_vec(), b"value1".to_vec()).unwrap();
+    /// val.hset(b"field2".to_vec(), b"value2".to_vec()).unwrap();
+    /// let vals = val.hvals().unwrap();
+    /// assert_eq!(vals.len(), 2);
+    /// ```
+    pub fn hvals(&self) -> Result<Vec<Vec<u8>>, OperationError> {
+        match self {
+            Value::Nil => Ok(Vec::new()),
+            Value::Hash(hash) => Ok(hash.hvals()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Returns all fields and values in a hash as an alternating list.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// val.hset(b"field1".to_vec(), b"value1".to_vec()).unwrap();
+    /// val.hset(b"field2".to_vec(), b"value2".to_vec()).unwrap();
+    /// let all = val.hgetall().unwrap();
+    /// assert_eq!(all.len(), 4);
+    /// ```
+    pub fn hgetall(&self) -> Result<Vec<Vec<u8>>, OperationError> {
+        match self {
+            Value::Nil => Ok(Vec::new()),
+            Value::Hash(hash) => Ok(hash.hgetall()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Returns the string length of a field value in a hash.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// val.hset(b"field1".to_vec(), b"value1".to_vec()).unwrap();
+    /// assert_eq!(val.hstrlen(b"field1").unwrap(), 6);
+    /// assert_eq!(val.hstrlen(b"field2").unwrap(), 0);
+    /// ```
+    pub fn hstrlen(&self, field: &[u8]) -> Result<usize, OperationError> {
+        match self {
+            Value::Nil => Ok(0),
+            Value::Hash(hash) => Ok(hash.hstrlen(field)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Increments a numeric field in a hash by an integer.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// assert_eq!(val.hincrby(b"field1".to_vec(), 5).unwrap(), 5);
+    /// assert_eq!(val.hincrby(b"field1".to_vec(), 3).unwrap(), 8);
+    /// ```
+    pub fn hincrby(&mut self, field: Vec<u8>, increment: i64) -> Result<i64, OperationError> {
+        match self {
+            Value::Nil => {
+                let mut hash = ValueHash::new();
+                let result = hash.hincrby(field.clone(), increment)?;
+                *self = Value::Hash(hash);
+                Ok(result)
+            }
+            Value::Hash(hash) => hash.hincrby(field, increment),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Increments a numeric field in a hash by a float.
+    ///
+    /// # Examples
+    /// ```
+    /// use database::Value;
+    ///
+    /// let mut val = Value::Nil;
+    /// assert_eq!(val.hincrbyfloat(b"field1".to_vec(), 5.5).unwrap(), 5.5);
+    /// assert_eq!(val.hincrbyfloat(b"field1".to_vec(), 3.2).unwrap(), 8.7);
+    /// ```
+    pub fn hincrbyfloat(&mut self, field: Vec<u8>, increment: f64) -> Result<f64, OperationError> {
+        match self {
+            Value::Nil => {
+                let mut hash = ValueHash::new();
+                let result = hash.hincrbyfloat(field.clone(), increment)?;
+                *self = Value::Hash(hash);
+                Ok(result)
+            }
+            Value::Hash(hash) => hash.hincrbyfloat(field, increment),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Scan set members with cursor-based iteration.
+    /// Returns (next_cursor, members) where next_cursor is 0 when done.
+    pub fn sscan(&self, cursor: usize, pattern: Option<&[u8]>, count: usize) -> Result<(usize, Vec<Vec<u8>>), OperationError> {
+        match self {
+            Value::Nil => Ok((0, Vec::new())),
+            Value::Set(set) => Ok(set.sscan(cursor, pattern, count)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Scan hash fields and values with cursor-based iteration.
+    /// Returns (next_cursor, fields_and_values) where next_cursor is 0 when done.
+    pub fn hscan(&self, cursor: usize, pattern: Option<&[u8]>, count: usize) -> Result<(usize, Vec<Vec<u8>>), OperationError> {
+        match self {
+            Value::Nil => Ok((0, Vec::new())),
+            Value::Hash(hash) => Ok(hash.hscan(cursor, pattern, count)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Scan sorted set members with scores using cursor-based iteration.
+    /// Returns (next_cursor, members_with_scores) where next_cursor is 0 when done.
+    pub fn zscan(&self, cursor: usize, pattern: Option<&[u8]>, count: usize) -> Result<(usize, Vec<Vec<u8>>), OperationError> {
+        match self {
+            Value::Nil => Ok((0, Vec::new())),
+            Value::SortedSet(zset) => Ok(zset.zscan(cursor, pattern, count)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
     /// Removes an element from a sorted set. Returns true if the element existed.
     ///
     /// # Examples
@@ -1629,6 +1920,7 @@ impl Value {
             Value::List(l) => l.dump(&mut data)?,
             Value::Set(s) => s.dump(&mut data)?,
             Value::SortedSet(s) => s.dump(&mut data)?,
+            Value::Hash(h) => h.dump(&mut data)?,
         };
         let crc = crc64(0, &*data);
         encode_u64_to_slice_u8(crc, &mut data).unwrap();
@@ -1644,6 +1936,7 @@ impl Value {
             Value::List(l) => l.debug_object(),
             Value::Set(s) => s.debug_object(),
             Value::SortedSet(s) => s.debug_object(),
+            Value::Hash(h) => h.debug_object(),
         }
     }
 
@@ -1654,6 +1947,7 @@ impl Value {
             Value::List(l) => l.llen() == 0,
             Value::Set(s) => s.scard() == 0,
             Value::SortedSet(s) => s.zcard() == 0,
+            Value::Hash(h) => h.is_empty(),
         }
     }
 }
@@ -1702,6 +1996,20 @@ pub struct Database {
     pub aof: Option<Aof>,
     /// Is it loading data from a file
     pub loading: bool,
+    /// Unix timestamp in seconds of last successful save
+    pub last_save_time: i64,
+    /// Approximate memory usage in bytes
+    pub used_memory: u64,
+    /// Peak memory usage in bytes
+    pub used_memory_peak: u64,
+    /// Number of keys evicted due to maxmemory
+    pub evicted_keys: u64,
+    /// Maps a key to its last access time (for LRU). Time is in milliseconds.
+    key_lru: Vec<RehashingHashMap<Vec<u8>, i64>>,
+    /// Slow log entries (circular buffer)
+    slowlog: Vec<SlowLogEntry>,
+    /// Next slow log entry ID
+    slowlog_id: u64,
 }
 
 pub struct Iter<'a> {
@@ -1745,11 +2053,13 @@ impl Database {
         let mut data_expiration_ms = Vec::with_capacity(size);
         let mut key_subscribers = Vec::with_capacity(size);
         let mut watched_keys = Vec::with_capacity(size);
+        let mut key_lru = Vec::with_capacity(size);
         for _ in 0..size {
             data.push(RehashingHashMap::new());
             data_expiration_ms.push(RehashingHashMap::new());
             key_subscribers.push(RehashingHashMap::new());
             watched_keys.push(HashMap::new());
+            key_lru.push(RehashingHashMap::new());
         }
         let aof = if config.appendonly {
             Some(Aof::new(&*config.appendfilename).unwrap())
@@ -1776,6 +2086,13 @@ impl Database {
             start_mstime: mstime(),
             aof,
             loading: false,
+            last_save_time: 0,
+            used_memory: 0,
+            used_memory_peak: 0,
+            evicted_keys: 0,
+            key_lru,
+            slowlog: Vec::new(),
+            slowlog_id: 0,
         }
     }
 
@@ -1812,6 +2129,209 @@ impl Database {
         self.data_expiration_ms[index].len()
     }
 
+    pub fn db_avg_ttl(&self, index: usize) -> i64 {
+        let expirations = &self.data_expiration_ms[index];
+        if expirations.is_empty() {
+            return 0;
+        }
+        let now = mstime();
+        let mut total_ttl = 0i64;
+        let mut count = 0usize;
+        for (_, &exp_time) in expirations.iter() {
+            if exp_time > now {
+                total_ttl += (exp_time - now) / 1000; // Convert to seconds
+                count += 1;
+            }
+        }
+        if count == 0 {
+            0
+        } else {
+            total_ttl / count as i64
+        }
+    }
+
+    /// Estimates the memory size of a Value in bytes
+    fn estimate_value_size(value: &Value, key_size: usize) -> u64 {
+        // Base overhead: key size + hashmap overhead (approx 24 bytes per entry)
+        let mut size = key_size as u64 + 24;
+        
+        match value {
+            Value::String(v) => {
+                size += match v {
+                    ValueString::Integer(_) => 8, // i64
+                    ValueString::Data(d) => d.len() as u64 + 8, // Vec overhead
+                };
+            }
+            Value::List(l) => {
+                size += match l {
+                    ValueList::Data(list) => {
+                        // Approximate: each node is ~32 bytes + data
+                        list.iter().map(|v| v.len() as u64 + 32).sum::<u64>()
+                    }
+                };
+            }
+            Value::Set(s) => {
+                size += match s {
+                    ValueSet::Integer(set) => {
+                        // HashSet overhead: ~24 bytes per entry + usize (8 bytes)
+                        set.len() as u64 * 32
+                    }
+                    ValueSet::Data(set) => {
+                        // HashSet overhead: ~24 bytes per entry + data
+                        set.iter().map(|v| v.len() as u64 + 24).sum::<u64>()
+                    }
+                };
+            }
+            Value::SortedSet(z) => {
+                size += match z {
+                    ValueSortedSet::Data(sl, hmap) => {
+                        // SkipList overhead: ~40 bytes per node + data
+                        let skiplist_size = sl.iter().map(|m| m.get_vec().len() as u64 + 40).sum::<u64>();
+                        // HashMap overhead: ~24 bytes per entry
+                        let hmap_size = hmap.len() as u64 * 24;
+                        skiplist_size + hmap_size
+                    }
+                };
+            }
+            Value::Hash(h) => {
+                // ValueHash can be ZipList or HashMap
+                size += match h {
+                    ValueHash::HashMap(map) => {
+                        // HashMap overhead: ~24 bytes per entry + key + value
+                        map.iter().map(|(k, v)| k.len() as u64 + v.len() as u64 + 24).sum::<u64>()
+                    }
+                    ValueHash::ZipList(zl) => {
+                        // Ziplist is more compact - just the serialized data size
+                        zl.len() as u64 + 16 // Small overhead for ziplist header
+                    }
+                };
+            }
+            Value::Nil => size += 0,
+        }
+        
+        size
+    }
+
+    /// Updates the LRU timestamp for a key
+    fn update_lru(&mut self, index: usize, key: &[u8]) {
+        if self.config.maxmemory_policy.contains("lru") {
+            let now = mstime();
+            self.key_lru[index].insert(key.to_vec(), now);
+        }
+    }
+
+    /// Evicts keys based on the maxmemory policy
+    fn evict_keys(&mut self, index: usize, needed_memory: u64) -> bool {
+        if let Some(maxmemory) = self.config.maxmemory {
+            if self.used_memory + needed_memory <= maxmemory {
+                return true; // No eviction needed
+            }
+
+            let policy = &*self.config.maxmemory_policy.to_ascii_lowercase();
+            let samples = self.config.maxmemory_samples;
+            let now = mstime();
+
+            loop {
+                if self.used_memory + needed_memory <= maxmemory {
+                    break true;
+                }
+
+                // Collect all candidate information first to avoid borrowing issues
+                let mut candidates: Vec<(Vec<u8>, i64, u64)> = Vec::new();
+                {
+                    // Scope to limit borrow
+                    let db_data = &self.data[index];
+                    let expirations = &self.data_expiration_ms[index];
+                    let lru_data = &self.key_lru[index];
+                    
+                    for key in db_data.keys() {
+                        let is_volatile = expirations.contains_key(key);
+                        
+                        // Filter by policy
+                        let should_include = match policy {
+                            "volatile-lru" | "volatile-random" | "volatile-ttl" => is_volatile,
+                            "allkeys-lru" | "allkeys-random" => true,
+                            _ => false, // noeviction
+                        };
+
+                        if !should_include {
+                            continue;
+                        }
+
+                        if let Some(value) = db_data.get(key) {
+                            let lru = lru_data.get(key).copied().unwrap_or(0);
+                            let size = Database::estimate_value_size(value, key.len());
+                            
+                            let score = match policy {
+                                "volatile-lru" | "allkeys-lru" => lru, // Lower is better (older)
+                                "volatile-ttl" => {
+                                    expirations.get(key).copied().unwrap_or(i64::MAX)
+                                }
+                                _ => 0, // Random, score doesn't matter
+                            };
+
+                            candidates.push((key.clone(), score, size));
+                        }
+                    }
+                } // Borrows released here
+
+                if candidates.is_empty() {
+                    // No candidates to evict, can't free memory
+                    return false;
+                }
+
+                // Select key to evict based on policy
+                let key_to_evict = match policy {
+                    "volatile-lru" | "allkeys-lru" => {
+                        // Sort by LRU (ascending - oldest first)
+                        candidates.sort_by_key(|(_, score, _)| *score);
+                        match candidates.first() {
+                            Some((k, _, _)) => k.clone(),
+                            None => return false,
+                        }
+                    }
+                    "volatile-ttl" => {
+                        // Sort by TTL (ascending - expires soonest)
+                        candidates.sort_by_key(|(_, score, _)| *score);
+                        match candidates.first() {
+                            Some((k, _, _)) => k.clone(),
+                            None => return false,
+                        }
+                    }
+                    "volatile-random" | "allkeys-random" => {
+                        // Random selection from samples
+                        if candidates.len() > samples {
+                            let start = rand::random::<usize>() % (candidates.len() - samples);
+                            match candidates[start..start + samples]
+                                .iter()
+                                .min_by_key(|(_, _, size)| *size)
+                            {
+                                Some((k, _, _)) => k.clone(),
+                                None => return false,
+                            }
+                        } else {
+                            match candidates.first() {
+                                Some((k, _, _)) => k.clone(),
+                                None => return false,
+                            }
+                        }
+                    }
+                    _ => return false, // noeviction
+                };
+
+                // Evict the key
+                if let Some(value) = self.remove(index, &key_to_evict) {
+                    // Memory is already updated in remove(), just update evicted count
+                    self.evicted_keys += 1;
+                    // Publish evicted event notification
+                    self.notify_keyspace_event(index, "evicted", &key_to_evict, Some('e'));
+                }
+            }
+        } else {
+            true // No maxmemory limit
+        }
+    }
+
     /// Gets a value from the database if exists and it is not expired.
     ///
     /// # Examples
@@ -1833,6 +2353,8 @@ impl Database {
         if self.is_expired(index, key) {
             None
         } else {
+            // Note: Can't update LRU here since we have &self, not &mut self
+            // LRU will be updated in get_mut or when key is accessed via get_or_create
             self.data[index].get(key)
         }
     }
@@ -1855,6 +2377,7 @@ impl Database {
             self.remove(index, key);
             None
         } else {
+            self.update_lru(index, key);
             self.data[index].get_mut(key)
         }
     }
@@ -1873,12 +2396,25 @@ impl Database {
     /// assert!(db.remove(0, &vec![1]).is_some());
     /// ```
     pub fn remove(&mut self, index: usize, key: &[u8]) -> Option<Value> {
+        let was_expired = self.is_expired(index, key);
         let mut r = self.data[index].remove(key);
-        if self.is_expired(index, key) {
+        if was_expired {
             r = None;
+            // Publish expired event notification
+            self.notify_keyspace_event(index, "expired", key, Some('x'));
+        }
+
+        // Update memory tracking
+        if let Some(ref value) = r {
+            let size = Database::estimate_value_size(value, key.len());
+            if self.used_memory >= size {
+                self.used_memory -= size;
+            }
         }
 
         self.data_expiration_ms[index].remove(key);
+        self.key_lru[index].remove(key);
+        
         if self.config.active_rehashing {
             if self.data[index].len() * 10 / 12 < self.data[index].capacity() {
                 self.data[index].shrink_to_fit();
@@ -1954,10 +2490,48 @@ impl Database {
             self.remove_msexpiration(index, key);
         }
 
-        match self.data[index].entry(key.to_vec()) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(val),
+        // Check if we need to evict keys before creating a new one
+        let is_new = !self.data[index].contains_key(key);
+        if is_new {
+            // Estimate memory needed for new key-value pair
+            let estimated_size = Database::estimate_value_size(&val, key.len());
+            if !self.evict_keys(index, estimated_size) {
+                // Eviction failed (noeviction policy or no candidates)
+                if let Some(maxmemory) = self.config.maxmemory {
+                    if self.used_memory + estimated_size > maxmemory {
+                        // Return existing Nil value - caller should handle OOM
+                        return self.data[index].entry(key.to_vec()).or_insert(val);
+                    }
+                }
+            }
         }
+
+        let entry = match self.data[index].entry(key.to_vec()) {
+            Entry::Occupied(mut entry) => {
+                // Update LRU before returning the mutable reference
+                let now = mstime();
+                if self.config.maxmemory_policy.contains("lru") {
+                    self.key_lru[index].insert(key.to_vec(), now);
+                }
+                entry.into_mut()
+            }
+            Entry::Vacant(entry) => {
+                // Track memory for new key
+                let size = Database::estimate_value_size(&val, key.len());
+                self.used_memory += size;
+                if self.used_memory > self.used_memory_peak {
+                    self.used_memory_peak = self.used_memory;
+                }
+                // Update LRU
+                let now = mstime();
+                if self.config.maxmemory_policy.contains("lru") {
+                    self.key_lru[index].insert(key.to_vec(), now);
+                }
+                entry.insert(val)
+            }
+        };
+
+        entry
     }
 
     /// Sets up the hashmap to subscribe clients to a key.
@@ -2140,6 +2714,41 @@ impl Database {
 
     /// Publishes a message to a channel and all patterns that match the channel name.
     /// Returns the number of recipients who receive the message.
+    pub fn pubsub_channels(&self) -> usize {
+        self.subscribers.len()
+    }
+
+    pub fn pubsub_patterns(&self) -> usize {
+        self.pattern_subscribers.len()
+    }
+
+    pub fn pubsub_channel_list(&self, pattern: Option<Vec<u8>>) -> Vec<Vec<u8>> {
+        use util::glob_match;
+        if let Some(pat) = pattern {
+            self.subscribers
+                .keys()
+                .filter(|channel| glob_match(&pat, channel, false))
+                .cloned()
+                .collect()
+        } else {
+            self.subscribers.keys().cloned().collect()
+        }
+    }
+
+    pub fn pubsub_numsub(&self, channels: &[Vec<u8>]) -> Vec<(Vec<u8>, usize)> {
+        channels
+            .iter()
+            .map(|channel| {
+                let count = self
+                    .subscribers
+                    .get(channel)
+                    .map(|subs| subs.len())
+                    .unwrap_or(0);
+                (channel.clone(), count)
+            })
+            .collect()
+    }
+
     pub fn publish(&self, channel_name: &[u8], message: &[u8]) -> usize {
         let mut c = 0;
         if let Some(channels) = self.subscribers.get(channel_name) {
@@ -2176,6 +2785,51 @@ impl Database {
             }
         }
         c
+    }
+
+    /// Checks if a keyspace notification flag is enabled
+    fn notify_flag_enabled(&self, flag: char) -> bool {
+        let events = &self.config.notify_keyspace_events;
+        if events.is_empty() {
+            return false;
+        }
+        
+        // Handle 'A' alias - expands to all event types
+        if events.contains('A') {
+            match flag {
+                'g' | '$' | 'l' | 's' | 'h' | 'z' | 'x' | 'e' => return true,
+                _ => {}
+            }
+        }
+        
+        events.contains(flag)
+    }
+
+    /// Publishes keyspace notifications for a key operation
+    pub fn notify_keyspace_event(&self, dbindex: usize, event_type: &str, key: &[u8], command_type: Option<char>) {
+        let events = &self.config.notify_keyspace_events;
+        if events.is_empty() {
+            return;
+        }
+
+        // Check if we should notify for this command type
+        if let Some(cmd_type) = command_type {
+            if !self.notify_flag_enabled(cmd_type) {
+                return;
+            }
+        }
+
+        // Publish keyspace event (K flag)
+        if self.notify_flag_enabled('K') {
+            let channel = format!("__keyspace@{}__:{}", dbindex, String::from_utf8_lossy(key));
+            self.publish(channel.as_bytes(), event_type.as_bytes());
+        }
+
+        // Publish keyevent event (E flag)
+        if self.notify_flag_enabled('E') {
+            let channel = format!("__keyevent@{}__:{}", dbindex, event_type);
+            self.publish(channel.as_bytes(), key);
+        }
     }
 
     /// Removes all data from all databases.
@@ -2242,6 +2896,35 @@ impl Database {
             }
         }
         responses
+    }
+
+    /// Scan keys from a database with cursor-based iteration.
+    /// Returns (next_cursor, keys) where next_cursor is 0 when done.
+    pub fn scan(&self, dbindex: usize, cursor: usize, pattern: Option<&[u8]>, count: usize) -> (usize, Vec<Vec<u8>>) {
+        let iter = self.iter_db(dbindex);
+        let all_keys: Vec<_> = iter.map(|(k, _)| k.clone()).collect();
+        let total = all_keys.len();
+        
+        if cursor >= total {
+            return (0, Vec::new());
+        }
+        
+        let end = std::cmp::min(cursor + count, total);
+        let mut result = Vec::new();
+        
+        for i in cursor..end {
+            let key = &all_keys[i];
+            if let Some(pat) = pattern {
+                if glob_match(pat, key, false) {
+                    result.push(key.clone());
+                }
+            } else {
+                result.push(key.clone());
+            }
+        }
+        
+        let next_cursor = if end >= total { 0 } else { end };
+        (next_cursor, result)
     }
 
     /// Tries to remove items that are already expired.
@@ -2323,6 +3006,67 @@ impl Database {
                 self.aof = None;
             }
         }
+    }
+
+    /// Adds a command to the slow log if it exceeds the threshold
+    pub fn slowlog_add(
+        &mut self,
+        command: &ParsedCommand,
+        duration_us: u64,
+        client_addr: String,
+        client_name: String,
+    ) {
+        let threshold = self.config.slowlog_log_slower_than;
+        if threshold > 0 && duration_us >= threshold as u64 {
+            let max_len = self.config.slowlog_max_len as usize;
+            
+            // Extract command arguments
+            let mut cmd_args = Vec::new();
+            for i in 0..command.argv.len() {
+                if let Ok(arg) = command.get_vec(i) {
+                    cmd_args.push(arg);
+                }
+            }
+            
+            let entry = SlowLogEntry {
+                id: self.slowlog_id,
+                timestamp: mstime() / 1000, // Convert to seconds
+                duration: duration_us,
+                command: cmd_args,
+                client_addr,
+                client_name,
+            };
+            
+            self.slowlog_id += 1;
+            self.slowlog.push(entry);
+            
+            // Maintain circular buffer - remove oldest entries if over limit
+            while self.slowlog.len() > max_len {
+                self.slowlog.remove(0);
+            }
+        }
+    }
+
+    /// Gets slow log entries
+    pub fn slowlog_get(&self, count: Option<usize>) -> Vec<&SlowLogEntry> {
+        let count = count.unwrap_or(self.slowlog.len());
+        let start = if count > self.slowlog.len() {
+            0
+        } else {
+            self.slowlog.len() - count
+        };
+        self.slowlog[start..].iter().rev().collect()
+    }
+
+    /// Gets slow log length
+    pub fn slowlog_len(&self) -> usize {
+        self.slowlog.len()
+    }
+
+    /// Resets the slow log
+    pub fn slowlog_reset(&mut self) {
+        self.slowlog.clear();
+        self.slowlog_id = 0;
     }
 }
 

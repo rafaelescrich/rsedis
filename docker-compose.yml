@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  rsedis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rsedis:latest
+    container_name: rsedis
+    ports:
+      - "6379:6379"
+    volumes:
+      - rsedis-data:/data
+      - ./rsedis.conf:/etc/rsedis/rsedis.conf:ro
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "echo -e '*1\\r\\n$$4\\r\\nPING\\r\\n' | timeout 1 nc localhost 6379 | grep -q PONG || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    command: ["/etc/rsedis/rsedis.conf"]
+    networks:
+      - rsedis-network
+
+volumes:
+  rsedis-data:
+    driver: local
+
+networks:
+  rsedis-network:
+    driver: bridge
+

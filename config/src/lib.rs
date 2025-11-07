@@ -43,6 +43,29 @@ pub struct Config {
     pub appendonly: bool,
     pub appendfilename: String,
     pub aof_load_truncated: bool,
+    pub dbfilename: String,
+    pub save: Vec<(u64, u64)>, // (seconds, changes) pairs
+    pub maxmemory: Option<u64>,
+    pub maxmemory_policy: String,
+    pub appendfsync: String,
+    pub stop_writes_on_bgsave_error: bool,
+    pub rdbcompression: bool,
+    pub rdbchecksum: bool,
+    pub maxclients: u64,
+    pub maxmemory_samples: usize,
+    pub no_appendfsync_on_rewrite: bool,
+    pub auto_aof_rewrite_percentage: i64,
+    pub auto_aof_rewrite_min_size: u64,
+    pub slowlog_log_slower_than: i64,
+    pub slowlog_max_len: u64,
+    pub latency_monitor_threshold: i64,
+    pub hash_max_ziplist_entries: usize,
+    pub hash_max_ziplist_value: usize,
+    pub list_max_ziplist_entries: usize,
+    pub list_max_ziplist_value: usize,
+    pub zset_max_ziplist_entries: usize,
+    pub zset_max_ziplist_value: usize,
+    pub notify_keyspace_events: String,
 }
 
 #[derive(Debug)]
@@ -106,6 +129,29 @@ impl Config {
             appendonly: false,
             appendfilename: "appendonly.aof".to_owned(),
             aof_load_truncated: false,
+            dbfilename: "dump.rdb".to_owned(),
+            save: vec![(900, 1), (300, 10), (60, 10000)], // Default Redis save points
+            maxmemory: None,
+            maxmemory_policy: "noeviction".to_owned(),
+            appendfsync: "everysec".to_owned(),
+            stop_writes_on_bgsave_error: true,
+            rdbcompression: true,
+            rdbchecksum: true,
+            maxclients: 10000,
+            maxmemory_samples: 5,
+            no_appendfsync_on_rewrite: false,
+            auto_aof_rewrite_percentage: 100,
+            auto_aof_rewrite_min_size: 67108864, // 64MB
+            slowlog_log_slower_than: 10000, // microseconds
+            slowlog_max_len: 128,
+            latency_monitor_threshold: 0,
+            hash_max_ziplist_entries: 512,
+            hash_max_ziplist_value: 64,
+            list_max_ziplist_entries: 512,
+            list_max_ziplist_value: 64,
+            zset_max_ziplist_entries: 128,
+            zset_max_ziplist_value: 64,
+            notify_keyspace_events: "".to_owned(), // Empty = disabled
         }
     }
 
@@ -204,6 +250,52 @@ impl Config {
                 b"appendonly" => self.appendonly = read_bool(args)?,
                 b"appendfilename" => self.appendfilename = read_string(args)?.to_owned(),
                 b"aof-load-truncated" => self.aof_load_truncated = read_bool(args)?,
+                b"dbfilename" => self.dbfilename = read_string(args)?.to_owned(),
+                b"save" => {
+                    if args.len() == 4 {
+                        let seconds_str = from_utf8(&*args[1])?.to_owned();
+                        let changes_str = from_utf8(&*args[2])?.to_owned();
+                        let seconds: u64 = seconds_str.parse().map_err(|_| ConfigError::InvalidParameter)?;
+                        let changes: u64 = changes_str.parse().map_err(|_| ConfigError::InvalidParameter)?;
+                        self.save.push((seconds, changes));
+                    } else {
+                        return Err(ConfigError::InvalidFormat);
+                    }
+                }
+                b"maxmemory" => {
+                    let val = read_string(args.clone())?;
+                    if val == "0" {
+                        self.maxmemory = None;
+                    } else {
+                        self.maxmemory = Some(read_parse(args)?);
+                    }
+                }
+                b"maxmemory-policy" => self.maxmemory_policy = read_string(args)?.to_owned(),
+                b"appendfsync" => {
+                    let val = read_string(args)?;
+                    match &*val.to_ascii_lowercase() {
+                        "always" | "everysec" | "no" => self.appendfsync = val,
+                        _ => return Err(ConfigError::InvalidParameter),
+                    }
+                }
+                b"stop-writes-on-bgsave-error" => self.stop_writes_on_bgsave_error = read_bool(args)?,
+                b"rdbcompression" => self.rdbcompression = read_bool(args)?,
+                b"rdbchecksum" => self.rdbchecksum = read_bool(args)?,
+                b"maxclients" => self.maxclients = read_parse(args)?,
+                b"maxmemory-samples" => self.maxmemory_samples = read_parse(args)?,
+                b"no-appendfsync-on-rewrite" => self.no_appendfsync_on_rewrite = read_bool(args)?,
+                b"auto-aof-rewrite-percentage" => self.auto_aof_rewrite_percentage = read_parse(args)?,
+                b"auto-aof-rewrite-min-size" => self.auto_aof_rewrite_min_size = read_parse(args)?,
+                b"slowlog-log-slower-than" => self.slowlog_log_slower_than = read_parse(args)?,
+                b"slowlog-max-len" => self.slowlog_max_len = read_parse(args)?,
+                b"latency-monitor-threshold" => self.latency_monitor_threshold = read_parse(args)?,
+                b"hash-max-ziplist-entries" => self.hash_max_ziplist_entries = read_parse(args)?,
+                b"hash-max-ziplist-value" => self.hash_max_ziplist_value = read_parse(args)?,
+                b"list-max-ziplist-entries" => self.list_max_ziplist_entries = read_parse(args)?,
+                b"list-max-ziplist-value" => self.list_max_ziplist_value = read_parse(args)?,
+                b"zset-max-ziplist-entries" => self.zset_max_ziplist_entries = read_parse(args)?,
+                b"zset-max-ziplist-value" => self.zset_max_ziplist_value = read_parse(args)?,
+                b"notify-keyspace-events" => self.notify_keyspace_events = read_string(args)?.to_owned(),
                 b"include" => {
                     if args.len() != 2 {
                         return Err(ConfigError::InvalidFormat);
@@ -224,7 +316,7 @@ impl Config {
 
     pub fn addresses(&self) -> Vec<(String, u16)> {
         if self.bind.is_empty() {
-            vec![("127.0.0.1".to_owned(), self.port)]
+            vec![("0.0.0.0".to_owned(), self.port)]
         } else {
             self.bind
                 .iter()
